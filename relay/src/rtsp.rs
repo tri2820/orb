@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use base64::prelude::*;
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
@@ -112,14 +112,8 @@ impl RtspClient {
             let _ = data_tx.send(fake_rtp).await;
         }
 
-        // Step 5: Start receiving RTP data
-        if rtp_port == 0 {
-            // TCP interleaved mode
-            self.receive_rtp_interleaved(data_tx).await?;
-        } else {
-            // UDP mode
-            self.receive_rtp_stream(rtp_port, data_tx).await?;
-        }
+        // Step 5: Start receiving RTP data (TCP interleaved mode)
+        self.receive_rtp_interleaved(data_tx).await?;
 
         Ok(())
     }
@@ -181,7 +175,7 @@ impl RtspClient {
             }
         };
 
-        // Try TCP interleaved transport first (more widely supported)
+        // Use TCP interleaved transport only
         let mut headers = vec![
             ("Transport".to_string(), "RTP/AVP/TCP;unicast;interleaved=0-1".to_string()),
         ];
@@ -192,26 +186,8 @@ impl RtspClient {
 
         let response = self.send_request("SETUP", &url, &headers).await?;
 
-        // If TCP fails, try UDP
         if response.status_code != 200 {
-            println!("TCP interleaved transport failed, trying UDP...");
-            let client_port = self.find_available_udp_port().await?;
-            let headers = vec![
-                ("Transport".to_string(),
-                 format!("RTP/AVP;unicast;client_port={}-{}", client_port, client_port + 1)),
-            ];
-
-            let response = self.send_request("SETUP", &url, &headers).await?;
-            if response.status_code != 200 {
-                return Err(anyhow!("SETUP failed with both TCP and UDP transport: {}", response.status_text));
-            }
-
-            // Extract session ID from response
-            if let Some(session_header) = response.headers.get("Session") {
-                self.session_id = Some(session_header.split(';').next().unwrap_or(session_header).to_string());
-            }
-
-            return Ok((client_port, client_port + 1));
+            return Err(anyhow!("SETUP failed with TCP transport: {}", response.status_text));
         }
 
         // Extract session ID from response
@@ -219,7 +195,7 @@ impl RtspClient {
             self.session_id = Some(session_header.split(';').next().unwrap_or(session_header).to_string());
         }
 
-        // For TCP interleaved mode, we use dummy ports
+        // For TCP interleaved mode, we use dummy ports (0 for RTP, 1 for RTCP)
         Ok((0, 1))
     }
 
@@ -376,44 +352,6 @@ impl RtspClient {
         }
 
         Ok(media_list)
-    }
-
-    async fn find_available_udp_port(&self) -> Result<u16> {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let local_addr = socket.local_addr()?;
-        Ok(local_addr.port())
-    }
-
-    async fn receive_rtp_stream(
-        &self,
-        rtp_port: u16,
-        data_tx: mpsc::Sender<Vec<u8>>,
-    ) -> Result<()> {
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", rtp_port)).await?;
-        let mut buf = [0u8; 2048];
-
-        println!("Starting to receive RTP data on port {}", rtp_port);
-
-        loop {
-            match timeout(Duration::from_secs(5), socket.recv_from(&mut buf)).await {
-                Ok(Ok((n, _))) if n > 0 => {
-                    if data_tx.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(Ok(_)) => {} // Empty packet
-                Ok(Err(e)) => {
-                    eprintln!("Error receiving RTP: {}", e);
-                    break;
-                }
-                Err(_) => {
-                    println!("RTP receive timeout, ending stream");
-                    break;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     async fn receive_rtp_interleaved(&mut self, data_tx: mpsc::Sender<Vec<u8>>) -> Result<()> {
