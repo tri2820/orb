@@ -1,3 +1,4 @@
+use crate::bridge_manager::BridgeManager;
 use crate::h264_depacketizer::H264Depacketizer;
 use crate::node_shadow::{NodeShadow, NodeShadows};
 use crate::rtsp::RtspClient;
@@ -25,6 +26,8 @@ pub struct WebRtcBridge {
     sessions: Arc<Mutex<HashMap<String, Arc<StreamSession>>>>,
     // Known services from config or announced by nodes
     node_shadows: Arc<Mutex<NodeShadows>>,
+    // Bridge manager for ORB protocol connections
+    bridge_manager: Arc<BridgeManager>,
 }
 
 pub struct StreamSession {
@@ -40,23 +43,28 @@ pub type NodeId = String;
 
 impl WebRtcBridge {
     pub fn default() -> Self {
-        Self::new(HashMap::new())
+        Self::new(HashMap::new(), Arc::new(BridgeManager::new()))
     }
 
-    pub fn new(node_shadows: NodeShadows) -> Self {
+    pub fn new(node_shadows: NodeShadows, bridge_manager: Arc<BridgeManager>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            // Update to use HashMap<node_id, Vec<Service>> if needed
             node_shadows: Arc::new(Mutex::new(node_shadows)),
+            bridge_manager,
         }
     }
 
-    async fn find_service(&self, service_id: &str) -> Option<Service> {
+    /// Get a reference to the bridge manager
+    pub fn bridge_manager(&self) -> Arc<BridgeManager> {
+        Arc::clone(&self.bridge_manager)
+    }
+
+    async fn find_service(&self, service_id: &str) -> Option<(String, Service)> {
         let node_shadows = self.node_shadows.lock().await;
-        for (_node_id, shadow) in node_shadows.iter() {
+        for (node_id, shadow) in node_shadows.iter() {
             for svc in &shadow.services {
                 if svc.id == service_id {
-                    return Some(svc.clone());
+                    return Some((node_id.clone(), svc.clone()));
                 }
             }
         }
@@ -69,7 +77,7 @@ impl WebRtcBridge {
             return Ok(Arc::clone(session));
         }
 
-        let service = self
+        let (_node_id, service) = self
             .find_service(service_id)
             .await
             .ok_or_else(|| anyhow!("Service not found: {}", service_id))?;
@@ -116,7 +124,7 @@ impl WebRtcBridge {
     }
 
     pub async fn start_rtsp_client(&self, service_id: &str) -> Result<()> {
-        let service = self
+        let (node_id, service) = self
             .find_service(service_id)
             .await
             .ok_or_else(|| anyhow!("Service not found: {}", service_id))?;
@@ -127,7 +135,10 @@ impl WebRtcBridge {
             .ok_or_else(|| anyhow!("Session not found: {}", service_id))?;
 
         let rtp_tx = session.rtp_tx.clone();
-        let service_id = service_id.to_string();
+        let service_id_str = service_id.to_string();
+
+        // Create a bridge connection to the node
+        let bridge_stream = self.bridge_manager.create_bridge(&node_id, &service).await?;
 
         tokio::spawn(async move {
             let path = if service.path.starts_with('/') {
@@ -137,11 +148,12 @@ impl WebRtcBridge {
             };
 
             println!(
-                "Connecting to RTSP service {} at {}:{}{}",
-                service_id, service.addr, service.port, path
+                "Connecting to RTSP service {} via bridge (node: {}) to {}:{}{}",
+                service_id_str, node_id, service.addr, service.port, path
             );
 
-            let mut rtsp_client = RtspClient::new(
+            // Create RTSP client with the bridge stream
+            let mut rtsp_client = RtspClient::with_stream(
                 service.addr.clone(),
                 service.port,
                 path.clone(),
@@ -150,11 +162,12 @@ impl WebRtcBridge {
                         Some((username.clone(), password.clone()))
                     }
                 }),
+                bridge_stream,
             );
 
-            match rtsp_client.connect_and_stream(rtp_tx).await {
-                Ok(_) => println!("RTSP stream ended for {}", service_id),
-                Err(e) => eprintln!("Failed to connect to RTSP service {}: {}", service_id, e),
+            match rtsp_client.start_streaming(rtp_tx).await {
+                Ok(_) => println!("RTSP stream ended for {}", service_id_str),
+                Err(e) => eprintln!("Failed to stream from RTSP service {}: {}", service_id_str, e),
             }
         });
 

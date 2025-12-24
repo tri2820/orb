@@ -7,15 +7,19 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
 /// RTSP client for connecting to RTSP streams
-pub struct RtspClient {
+/// Generic over any AsyncRead + AsyncWrite stream (TCP or Bridge)
+pub struct RtspClient<S> {
     host: String,
     port: u16,
     path: String,
     auth: Option<(String, String)>,
     session_id: Option<String>,
     cseq: u32,
-    stream: Option<TcpStream>,
+    stream: Option<S>,
 }
+
+/// Type alias for direct TCP RTSP client
+pub type DirectRtspClient = RtspClient<TcpStream>;
 
 #[derive(Debug)]
 pub struct SdpMedia {
@@ -31,8 +35,18 @@ struct RtspResponse {
     body: Option<String>,
 }
 
-impl RtspClient {
-    pub fn new(host: String, port: u16, path: String, auth: Option<(String, String)>) -> Self {
+impl<S> RtspClient<S>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin,
+{
+    /// Create a new RTSP client with a pre-existing stream
+    pub fn with_stream(
+        host: String,
+        port: u16,
+        path: String,
+        auth: Option<(String, String)>,
+        stream: S,
+    ) -> Self {
         Self {
             host,
             port,
@@ -40,12 +54,12 @@ impl RtspClient {
             auth,
             session_id: None,
             cseq: 1,
-            stream: None,
+            stream: Some(stream),
         }
     }
 
-    /// Connect to RTSP server and start streaming
-    pub async fn connect_and_stream(&mut self, data_tx: mpsc::Sender<Vec<u8>>) -> Result<()> {
+    /// Start streaming (stream must already be connected)
+    pub async fn start_streaming(&mut self, data_tx: mpsc::Sender<Vec<u8>>) -> Result<()> {
         // Step 1: OPTIONS
         self.send_options().await?;
 
@@ -221,12 +235,9 @@ impl RtspClient {
         url: &str,
         headers: &[(String, String)],
     ) -> Result<RtspResponse> {
-        // Create connection if it doesn't exist or if it's closed
-        if self.stream.is_none() {
-            self.stream = Some(TcpStream::connect(format!("{}:{}", self.host, self.port)).await?);
-        }
-
-        let stream = self.stream.as_mut().unwrap();
+        // Stream must already be connected
+        let stream = self.stream.as_mut()
+            .ok_or_else(|| anyhow!("Stream not connected"))?;
 
         // Build request manually as string
         let mut request = format!("{} {} RTSP/1.0\r\n", method, url);
@@ -406,5 +417,31 @@ impl RtspClient {
         }
 
         Ok(())
+    }
+}
+
+/// Implementation specific to direct TCP connections
+impl RtspClient<TcpStream> {
+    /// Create a new RTSP client for direct TCP connection
+    pub fn new(host: String, port: u16, path: String, auth: Option<(String, String)>) -> Self {
+        Self {
+            host,
+            port,
+            path,
+            auth,
+            session_id: None,
+            cseq: 1,
+            stream: None,
+        }
+    }
+
+    /// Connect to RTSP server and start streaming
+    pub async fn connect_and_stream(&mut self, data_tx: mpsc::Sender<Vec<u8>>) -> Result<()> {
+        // Create TCP connection
+        let tcp_stream = TcpStream::connect(format!("{}:{}", self.host, self.port)).await?;
+        self.stream = Some(tcp_stream);
+
+        // Start streaming
+        self.start_streaming(data_tx).await
     }
 }
