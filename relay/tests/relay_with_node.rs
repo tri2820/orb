@@ -1,7 +1,6 @@
 use anyhow::Result;
-use orb_node::{Auth, ControlMessage, Message, ProtocolHandler, Service};
+use orb_node::{ControlMessage, Message, ProtocolHandler};
 use orb_relay::{http, webrtc::WebRtcBridge};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 

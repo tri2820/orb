@@ -1,7 +1,6 @@
 use anyhow::Result;
-use orb_node::{message::read_config, NodeId, Service};
 use orb_relay::{http, node_shadow, webrtc::WebRtcBridge};
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 /// Manual test to start the relay server for browser testing
 /// Run with: cargo test relay_server -- --ignored --nocapture
