@@ -51,8 +51,8 @@ impl WebRtcBridge {
         }
     }
 
-    fn find_service(&self, service_id: &str) -> Option<Service> {
-        let node_shadows = self.node_shadows.blocking_lock();
+    async fn find_service(&self, service_id: &str) -> Option<Service> {
+        let node_shadows = self.node_shadows.lock().await;
         for (_node_id, shadow) in node_shadows.iter() {
             for svc in &shadow.services {
                 if svc.id == service_id {
@@ -71,6 +71,7 @@ impl WebRtcBridge {
 
         let service = self
             .find_service(service_id)
+            .await
             .ok_or_else(|| anyhow!("Service not found: {}", service_id))?;
 
         if service.svc_type != "rtsp" {
@@ -117,6 +118,7 @@ impl WebRtcBridge {
     pub async fn start_rtsp_client(&self, service_id: &str) -> Result<()> {
         let service = self
             .find_service(service_id)
+            .await
             .ok_or_else(|| anyhow!("Service not found: {}", service_id))?;
 
         let sessions = self.sessions.lock().await;

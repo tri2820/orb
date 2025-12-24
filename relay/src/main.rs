@@ -4,10 +4,6 @@ use orb_relay::{http, webrtc::WebRtcBridge};
 
 #[derive(Parser)]
 struct Args {
-    /// Path to the configuration file
-    #[arg(long, short = 'c', default_value = "config.json")]
-    config: String,
-
     /// HTTP port for WebRTC signaling
     #[arg(long, short = 'p', default_value = "8080")]
     port: u16,

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use orb_node::{message::read_config, NodeId};
 
@@ -10,7 +11,9 @@ pub type NodeShadows = HashMap<NodeId, NodeShadow>;
 
 pub fn create_example_nodes() -> NodeShadows {
     // Load and parse config file
-    let config = read_config("config.json").expect("Failed to read config file");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let config_path = root.join("config.json");
+    let config = read_config(config_path).expect("Failed to read config file");
 
     let mut node_shadows: NodeShadows = HashMap::new();
     node_shadows.insert(
