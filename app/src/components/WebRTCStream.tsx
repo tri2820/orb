@@ -3,7 +3,7 @@ import { createSignal, onMount, onCleanup, type Component } from 'solid-js';
 const WebRTCStream: Component = () => {
   const [video, setVideo] = createSignal<HTMLVideoElement>();
   const [status, setStatus] = createSignal('');
-  const [serviceId, setServiceId] = createSignal('rtsp-1');
+  const [serviceId, setServiceId] = createSignal('rtsp-camera');
   const [pc, setPc] = createSignal<RTCPeerConnection>();
   const [statsInterval, setStatsInterval] = createSignal<number>();
 

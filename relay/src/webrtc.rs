@@ -1,7 +1,8 @@
-use crate::config::Service;
 use crate::h264_depacketizer::H264Depacketizer;
+use crate::node_shadow::{NodeShadow, NodeShadows};
 use crate::rtsp::RtspClient;
 use anyhow::{anyhow, Result};
+use orb_node::{Auth, Service};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,8 +23,8 @@ use webrtc::track::track_local::TrackLocal;
 pub struct WebRtcBridge {
     // service_id -> StreamSession
     sessions: Arc<Mutex<HashMap<String, Arc<StreamSession>>>>,
-    // Known services from config
-    services: HashMap<String, Service>,
+    // Known services from config or announced by nodes
+    node_shadows: Arc<Mutex<NodeShadows>>,
 }
 
 pub struct StreamSession {
@@ -35,12 +36,31 @@ pub struct StreamSession {
     pub rtp_tx: mpsc::Sender<Vec<u8>>,
 }
 
+pub type NodeId = String;
+
 impl WebRtcBridge {
-    pub fn new(services: HashMap<String, Service>) -> Self {
+    pub fn default() -> Self {
+        Self::new(HashMap::new())
+    }
+
+    pub fn new(node_shadows: NodeShadows) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            services,
+            // Update to use HashMap<node_id, Vec<Service>> if needed
+            node_shadows: Arc::new(Mutex::new(node_shadows)),
         }
+    }
+
+    fn find_service(&self, service_id: &str) -> Option<Service> {
+        let node_shadows = self.node_shadows.blocking_lock();
+        for (_node_id, shadow) in node_shadows.iter() {
+            for svc in &shadow.services {
+                if svc.id == service_id {
+                    return Some(svc.clone());
+                }
+            }
+        }
+        None
     }
 
     pub async fn create_session(&self, service_id: &str) -> Result<Arc<StreamSession>> {
@@ -49,10 +69,8 @@ impl WebRtcBridge {
             return Ok(Arc::clone(session));
         }
 
-        // Check if service exists
         let service = self
-            .services
-            .get(service_id)
+            .find_service(service_id)
             .ok_or_else(|| anyhow!("Service not found: {}", service_id))?;
 
         if service.svc_type != "rtsp" {
@@ -96,15 +114,10 @@ impl WebRtcBridge {
         Ok(session)
     }
 
-    pub async fn start_rtsp_client(
-        &self,
-        service_id: &str,
-    ) -> Result<()> {
+    pub async fn start_rtsp_client(&self, service_id: &str) -> Result<()> {
         let service = self
-            .services
-            .get(service_id)
-            .ok_or_else(|| anyhow!("Service not found: {}", service_id))?
-            .clone();
+            .find_service(service_id)
+            .ok_or_else(|| anyhow!("Service not found: {}", service_id))?;
 
         let sessions = self.sessions.lock().await;
         let session = sessions
@@ -123,14 +136,18 @@ impl WebRtcBridge {
 
             println!(
                 "Connecting to RTSP service {} at {}:{}{}",
-                service_id, service.ip, service.port, path
+                service_id, service.addr, service.port, path
             );
 
             let mut rtsp_client = RtspClient::new(
-                service.ip.clone(),
+                service.addr.clone(),
                 service.port,
                 path.clone(),
-                service.auth.as_ref().map(|auth| (auth.username.clone(), auth.password.clone())),
+                service.auth.as_ref().and_then(|auth| match auth {
+                    Auth::UsernameAndPassword { username, password } => {
+                        Some((username.clone(), password.clone()))
+                    }
+                }),
             );
 
             match rtsp_client.connect_and_stream(rtp_tx).await {
@@ -184,17 +201,24 @@ impl WebRtcBridge {
             let pc_clone = Arc::clone(&pc_clone);
 
             Box::pin(async move {
-                if state == RTCIceConnectionState::Disconnected || state == RTCIceConnectionState::Failed {
+                if state == RTCIceConnectionState::Disconnected
+                    || state == RTCIceConnectionState::Failed
+                {
                     // Start a timeout to clean up if the connection doesn't recover
                     tokio::time::sleep(Duration::from_secs(5)).await;
 
                     // Re-check state after timeout
-                    if pc_clone.ice_connection_state() == RTCIceConnectionState::Disconnected || pc_clone.ice_connection_state() == RTCIceConnectionState::Failed {
+                    if pc_clone.ice_connection_state() == RTCIceConnectionState::Disconnected
+                        || pc_clone.ice_connection_state() == RTCIceConnectionState::Failed
+                    {
                         let mut sessions = sessions_map_clone.lock().await;
                         if let Some(session) = sessions.get(&service_id_clone) {
                             let count = session.subscriber_count.fetch_sub(1, Ordering::SeqCst);
                             if count == 1 {
-                                println!("Last subscriber disconnected for {}. Cleaning up.", service_id_clone);
+                                println!(
+                                    "Last subscriber disconnected for {}. Cleaning up.",
+                                    service_id_clone
+                                );
                                 sessions.remove(&service_id_clone);
                             }
                         }
@@ -204,7 +228,10 @@ impl WebRtcBridge {
                     if let Some(session) = sessions.get(&service_id_clone) {
                         let count = session.subscriber_count.fetch_sub(1, Ordering::SeqCst);
                         if count == 1 {
-                            println!("Last subscriber disconnected for {}. Cleaning up.", service_id_clone);
+                            println!(
+                                "Last subscriber disconnected for {}. Cleaning up.",
+                                service_id_clone
+                            );
                             sessions.remove(&service_id_clone);
                         }
                     }
@@ -230,6 +257,20 @@ impl WebRtcBridge {
             .ok_or_else(|| anyhow!("Failed to get local description"))?;
 
         Ok(local_desc.sdp)
+    }
+
+    /// Register services announced by a node
+    pub async fn register_services(&self, node_id: &str, services: Vec<Service>) -> Result<()> {
+        let mut self_node_shadows = self.node_shadows.lock().await;
+        // Insert or replace services for this node
+        self_node_shadows.insert(node_id.to_string(), NodeShadow { services });
+        Ok(())
+    }
+
+    /// Remove all services from a node (when it disconnects)
+    pub async fn unregister_node(&self, node_id: &str) {
+        let mut self_node_shadows = self.node_shadows.lock().await;
+        self_node_shadows.remove(node_id);
     }
 }
 
@@ -258,7 +299,8 @@ impl StreamSession {
         }
 
         let marker = (rtp_packet[1] & 0x80) != 0;
-        let timestamp = u32::from_be_bytes([rtp_packet[4], rtp_packet[5], rtp_packet[6], rtp_packet[7]]);
+        let timestamp =
+            u32::from_be_bytes([rtp_packet[4], rtp_packet[5], rtp_packet[6], rtp_packet[7]]);
         let payload = &rtp_packet[12..];
 
         if let Some(frame) = depacketizer.push(payload)? {
@@ -295,11 +337,13 @@ impl StreamSession {
                 d.into()
             };
 
-            self.track.write_sample(&Sample {
-                data: final_data,
-                duration,
-                ..Default::default()
-            }).await?;
+            self.track
+                .write_sample(&Sample {
+                    data: final_data,
+                    duration,
+                    ..Default::default()
+                })
+                .await?;
         }
 
         Ok(())
