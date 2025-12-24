@@ -48,14 +48,9 @@ impl Node {
 
     /// Announce services to the relay
     pub async fn announce(&self, services: Vec<Service>) -> Result<()> {
-        let msg_id = uuid::Uuid::new_v4().to_string();
-
-        let msg = Message::Control {
-            control: ControlMessage::Announce {
-                services: services.clone(),
-                msg_id,
-            },
-        };
+        let msg = Message::control(ControlMessage::Announce {
+            services: services.clone(),
+        });
 
         *self.announced_services.lock().await = services;
         self.send_message(msg).await?;
@@ -66,17 +61,13 @@ impl Node {
     /// Handle an incoming message from the relay
     pub async fn handle_message(&self, msg: Message) -> Result<()> {
         match msg {
-            Message::Control { control } => {
+            Message::Control { msg_id, control } => {
                 match control {
-                    ControlMessage::OpenBridge {
-                        bridge_id,
-                        service,
-                        msg_id,
-                    } => {
+                    ControlMessage::OpenBridge { bridge_id, service } => {
                         self.handle_open_bridge(bridge_id.clone(), service.clone(), msg_id)
                             .await?;
                     }
-                    ControlMessage::CloseBridge { bridge_id, msg_id } => {
+                    ControlMessage::CloseBridge { bridge_id } => {
                         self.handle_close_bridge(bridge_id, msg_id).await?;
                     }
                     _ => {
@@ -84,7 +75,7 @@ impl Node {
                     }
                 }
             }
-            Message::Data { data } => {
+            Message::Data { data, .. } => {
                 self.handle_data(data.bridge_id, data.payload).await?;
             }
         }
@@ -129,13 +120,9 @@ impl Node {
     // Private helper methods
 
     async fn send_register(&self) -> Result<()> {
-        let msg_id = uuid::Uuid::new_v4().to_string();
-        let msg = Message::Control {
-            control: ControlMessage::Register {
-                node_id: self.node_id.clone(),
-                msg_id,
-            },
-        };
+        let msg = Message::control(ControlMessage::Register {
+            node_id: self.node_id.clone(),
+        });
 
         self.send_message(msg).await?;
         Ok(())
@@ -175,11 +162,7 @@ impl Node {
         );
 
         // Send ACK
-        let ack = Message::Control {
-            control: ControlMessage::Ack {
-                msg_id: Some(msg_id),
-            },
-        };
+        let ack = Message::ack(msg_id);
         self.send_message(ack).await?;
 
         Ok(())

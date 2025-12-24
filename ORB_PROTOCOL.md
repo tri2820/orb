@@ -93,10 +93,10 @@ All messages are CBOR-encoded maps with exactly one CBOR object per message.
 
 ```json
 {
+  "msg_id": "msg-001",
   "control": {
     "type": "register",
-    "node_id": "node-001",
-    "msg_id": "msg-001"
+    "node_id": "node-001"
   }
 }
 ```
@@ -107,6 +107,7 @@ Declares services reachable by the Node.
 
 ```json
 {
+  "msg_id": "msg-002",
   "control": {
     "type": "announce",
     "services": [
@@ -118,8 +119,7 @@ Declares services reachable by the Node.
         "addr": "127.0.0.1",
         "port": 443
       }
-    ],
-    "msg_id": "msg-002"
+    ]
   }
 }
 ```
@@ -130,25 +130,28 @@ Relay stores announced services but does not interpret them.
 
 ```json
 {
+  "msg_id": "ack-uuid-001",
   "control": {
     "type": "ack",
-    "msg_id": "optional"
+    "ack_msg_id": "msg-001"
   }
 }
 ```
+
+The ACK message has its own unique `msg_id`, and the `ack_msg_id` field contains the `msg_id` of the message being acknowledged.
 
 ### OPEN_BRIDGE (Relay → Node)
 
 ```json
 {
+  "msg_id": "msg-003",
   "control": {
     "type": "open_bridge",
     "bridge_id": "bridge-123",
     "service": {
       "addr": "192.168.1.100",
       "port": 554
-    },
-    "msg_id": "msg-003"
+    }
   }
 }
 ```
@@ -157,10 +160,10 @@ Relay stores announced services but does not interpret them.
 
 ```json
 {
+  "msg_id": "msg-004",
   "control": {
     "type": "close_bridge",
-    "bridge_id": "bridge-123",
-    "msg_id": "msg-004"
+    "bridge_id": "bridge-123"
   }
 }
 ```
@@ -169,12 +172,15 @@ Relay stores announced services but does not interpret them.
 
 ```json
 {
+  "msg_id": "msg-005",
   "data": {
     "bridge_id": "bridge-123",
     "payload": <byte string>
   }
 }
 ```
+
+All messages in the ORB protocol include a `msg_id` field at the top level for tracking and correlation purposes.
 
 ## Flows
 

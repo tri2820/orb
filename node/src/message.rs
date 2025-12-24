@@ -1,12 +1,5 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::fs;
-
-/// Configuration structures for services
-#[derive(Deserialize, Serialize, Debug, Clone)]
-pub struct Config {
-    pub services: Vec<Service>,
-}
 
 /// Authentication configuration for a service
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,27 +22,26 @@ pub struct Service {
     pub auth: Option<Auth>,
 }
 
+/// Allowlist configuration containing a list of services
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllowList {
+    pub services: Vec<Service>,
+}
+
 /// Control messages in the ORB Protocol
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ControlMessage {
     #[serde(rename = "register")]
-    Register { node_id: String, msg_id: String },
+    Register { node_id: String },
     #[serde(rename = "announce")]
-    Announce {
-        services: Vec<Service>,
-        msg_id: String,
-    },
+    Announce { services: Vec<Service> },
     #[serde(rename = "ack")]
-    Ack { msg_id: Option<String> },
+    Ack { ack_msg_id: String },
     #[serde(rename = "open_bridge")]
-    OpenBridge {
-        bridge_id: String,
-        service: Service,
-        msg_id: String,
-    },
+    OpenBridge { bridge_id: String, service: Service },
     #[serde(rename = "close_bridge")]
-    CloseBridge { bridge_id: String, msg_id: String },
+    CloseBridge { bridge_id: String },
 }
 
 /// Data messages in the ORB Protocol
@@ -65,9 +57,12 @@ pub struct DataMessage {
 #[serde(untagged)]
 pub enum Message {
     #[serde(rename = "control")]
-    Control { control: ControlMessage },
+    Control {
+        msg_id: String,
+        control: ControlMessage,
+    },
     #[serde(rename = "data")]
-    Data { data: DataMessage },
+    Data { msg_id: String, data: DataMessage },
 }
 
 impl Message {
@@ -78,24 +73,38 @@ impl Message {
     pub fn decode(buf: &[u8]) -> Result<Self> {
         serde_cbor::from_slice(buf).map_err(|e| anyhow!("CBOR decoding error: {}", e))
     }
-}
 
-/// Read and parse configuration from a file path
-pub fn read_config<P: AsRef<std::path::Path>>(path: P) -> Result<Config> {
-    let config_path = path.as_ref();
-    let config_content = fs::read_to_string(config_path)
-        .map_err(|e| anyhow!("Failed to read config file '{:?}': {}", config_path, e))?;
-
-    let config: Config = serde_json::from_str(&config_content)
-        .map_err(|e| anyhow!("Failed to parse config file '{:?}': {}", config_path, e))?;
-
-    if config.services.is_empty() {
-        return Err(anyhow!("No services found in config file"));
+    /// Get msg_id from any message
+    pub fn msg_id(&self) -> &str {
+        match self {
+            Message::Control { msg_id, .. } => msg_id,
+            Message::Data { msg_id, .. } => msg_id,
+        }
     }
 
-    Ok(Config {
-        services: config.services,
-    })
+    /// Create a control message with auto-generated msg_id
+    pub fn control(control: ControlMessage) -> Self {
+        Message::Control {
+            msg_id: uuid::Uuid::new_v4().to_string(),
+            control,
+        }
+    }
+
+    /// Create a data message with auto-generated msg_id
+    pub fn data(data: DataMessage) -> Self {
+        Message::Data {
+            msg_id: uuid::Uuid::new_v4().to_string(),
+            data,
+        }
+    }
+
+    /// Create an ACK message for a given message ID
+    pub fn ack(ack_msg_id: String) -> Self {
+        Message::Control {
+            msg_id: uuid::Uuid::new_v4().to_string(),
+            control: ControlMessage::Ack { ack_msg_id },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -105,9 +114,9 @@ mod tests {
     #[test]
     fn test_register_message() {
         let msg = Message::Control {
+            msg_id: "msg-001".to_string(),
             control: ControlMessage::Register {
                 node_id: "node-001".to_string(),
-                msg_id: "msg-001".to_string(),
             },
         };
 
@@ -115,10 +124,10 @@ mod tests {
         let decoded = Message::decode(&encoded).unwrap();
 
         match decoded {
-            Message::Control { control } => {
-                if let ControlMessage::Register { node_id, msg_id } = control {
+            Message::Control { msg_id, control } => {
+                assert_eq!(msg_id, "msg-001");
+                if let ControlMessage::Register { node_id } = control {
                     assert_eq!(node_id, "node-001");
-                    assert_eq!(msg_id, "msg-001");
                 } else {
                     panic!("Wrong control message type");
                 }
@@ -130,6 +139,7 @@ mod tests {
     #[test]
     fn test_data_message() {
         let msg = Message::Data {
+            msg_id: "msg-002".to_string(),
             data: DataMessage {
                 bridge_id: "bridge-123".to_string(),
                 payload: vec![1, 2, 3, 4, 5],
@@ -140,7 +150,8 @@ mod tests {
         let decoded = Message::decode(&encoded).unwrap();
 
         match decoded {
-            Message::Data { data } => {
+            Message::Data { msg_id, data } => {
+                assert_eq!(msg_id, "msg-002");
                 assert_eq!(data.bridge_id, "bridge-123");
                 assert_eq!(data.payload, vec![1, 2, 3, 4, 5]);
             }

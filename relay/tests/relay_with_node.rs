@@ -19,12 +19,9 @@ async fn run_node_with_config(relay_addr: &str, relay_port: u16) -> Result<()> {
     let mut protocol = ProtocolHandler::new(stream);
 
     // Send REGISTER
-    let register = Message::Control {
-        control: ControlMessage::Register {
-            node_id: "config-node".to_string(),
-            msg_id: uuid::Uuid::new_v4().to_string(),
-        },
-    };
+    let register = Message::control(ControlMessage::Register {
+        node_id: "config-node".to_string(),
+    });
     protocol.send(&register).await?;
     println!("[Node] ✓ Sent REGISTER");
 
@@ -32,12 +29,9 @@ async fn run_node_with_config(relay_addr: &str, relay_port: u16) -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Send ANNOUNCE with services from config
-    let announce = Message::Control {
-        control: ControlMessage::Announce {
-            services: node_shadow.services.clone(),
-            msg_id: uuid::Uuid::new_v4().to_string(),
-        },
-    };
+    let announce = Message::control(ControlMessage::Announce {
+        services: node_shadow.services.clone(),
+    });
     protocol.send(&announce).await?;
     println!(
         "[Node] ✓ Sent ANNOUNCE with {} services",
@@ -110,14 +104,19 @@ async fn relay_with_node() -> Result<()> {
                             Ok(Some(msg)) => {
                                 println!("[Relay] Received from node: {:?}", msg);
 
+                                // Extract msg_id before match to avoid borrow issues
+                                let msg_id = msg.msg_id().to_string();
+
                                 match msg {
                                     Message::Control {
-                                        control: ControlMessage::Register { node_id: nid, .. },
+                                        control: ControlMessage::Register { node_id: nid },
+                                        ..
                                     } => {
                                         node_id = nid;
                                     }
                                     Message::Control {
-                                        control: ControlMessage::Announce { services, .. },
+                                        control: ControlMessage::Announce { services },
+                                        ..
                                     } => {
                                         println!(
                                             "[Relay] Received announce: {} services",
@@ -137,9 +136,7 @@ async fn relay_with_node() -> Result<()> {
                                 }
 
                                 // Send ACK
-                                let ack = Message::Control {
-                                    control: ControlMessage::Ack { msg_id: None },
-                                };
+                                let ack = Message::ack(msg_id);
                                 let _ = protocol.send(&ack).await;
                             }
                             Ok(None) => break,

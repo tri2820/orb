@@ -92,9 +92,7 @@ async fn test_indirect_connection_through_node() -> Result<()> {
                     println!("Relay received: {:?}", msg);
 
                     // Send ACK back to node
-                    let ack = Message::Control {
-                        control: ControlMessage::Ack { msg_id: None },
-                    };
+                    let ack = Message::ack(msg.msg_id().to_string());
                     let _ = socket.write_all(&ack.encode().unwrap()).await;
                 }
             }
@@ -105,28 +103,23 @@ async fn test_indirect_connection_through_node() -> Result<()> {
                     println!("Relay received announce: {:?}", msg);
 
                     // Send ACK back
-                    let ack = Message::Control {
-                        control: ControlMessage::Ack { msg_id: None },
-                    };
+                    let ack = Message::ack(msg.msg_id().to_string());
                     let _ = socket.write_all(&ack.encode().unwrap()).await;
                 }
             }
 
             // Send OPEN_BRIDGE to node
-            let open_bridge = Message::Control {
-                control: ControlMessage::OpenBridge {
-                    bridge_id: "bridge-001".to_string(),
-                    service: Service {
-                        svc_type: "http".to_string(),
-                        id: "echo-service".to_string(),
-                        addr: "127.0.0.1".to_string(),
-                        port: 9002,
-                        path: "/".to_string(),
-                        auth: None,
-                    },
-                    msg_id: "msg-003".to_string(),
+            let open_bridge = Message::control(ControlMessage::OpenBridge {
+                bridge_id: "bridge-001".to_string(),
+                service: Service {
+                    svc_type: "http".to_string(),
+                    id: "echo-service".to_string(),
+                    addr: "127.0.0.1".to_string(),
+                    port: 9002,
+                    path: "/".to_string(),
+                    auth: None,
                 },
-            };
+            });
             if let Ok(encoded) = open_bridge.encode() {
                 let _ = socket.write_all(&encoded).await;
             }
@@ -139,12 +132,10 @@ async fn test_indirect_connection_through_node() -> Result<()> {
             }
 
             // Send DATA message to node
-            let data_msg = Message::Data {
-                data: DataMessage {
-                    bridge_id: "bridge-001".to_string(),
-                    payload: b"indirect connection test".to_vec(),
-                },
-            };
+            let data_msg = Message::data(DataMessage {
+                bridge_id: "bridge-001".to_string(),
+                payload: b"indirect connection test".to_vec(),
+            });
             if let Ok(encoded) = data_msg.encode() {
                 let _ = socket.write_all(&encoded).await;
             }
@@ -175,30 +166,24 @@ async fn test_indirect_connection_through_node() -> Result<()> {
             *node.relay_stream.lock().await = Some(stream);
 
             // Send REGISTER
-            let register = Message::Control {
-                control: ControlMessage::Register {
-                    node_id: "node-001".to_string(),
-                    msg_id: "msg-001".to_string(),
-                },
-            };
+            let register = Message::control(ControlMessage::Register {
+                node_id: "node-001".to_string(),
+            });
             let _ = node.send_message(register).await;
 
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
             // Send ANNOUNCE
-            let announce = Message::Control {
-                control: ControlMessage::Announce {
-                    services: vec![Service {
-                        svc_type: "http".to_string(),
-                        id: "echo-service".to_string(),
-                        addr: "127.0.0.1".to_string(),
-                        port: 9002,
-                        path: "/".to_string(),
-                        auth: None,
-                    }],
-                    msg_id: "msg-002".to_string(),
-                },
-            };
+            let announce = Message::control(ControlMessage::Announce {
+                services: vec![Service {
+                    svc_type: "http".to_string(),
+                    id: "echo-service".to_string(),
+                    addr: "127.0.0.1".to_string(),
+                    port: 9002,
+                    path: "/".to_string(),
+                    auth: None,
+                }],
+            });
             let _ = node.send_message(announce).await;
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
