@@ -293,14 +293,20 @@ impl StreamSession {
     async fn ingest_rtp(&self, data: Vec<u8>) -> Result<()> {
         let mut depacketizer = self.depacketizer.lock().await;
 
+        // Debug: show what we received
+        println!("[ingest_rtp] Received {} bytes, first byte: 0x{:02x}", data.len(), data.first().unwrap_or(&0));
+
         // Detect if data is RTSP-framed ($) or raw RTP
         let rtp_packet = if !data.is_empty() && data[0] == b'$' {
             if data.len() < 4 {
+                println!("[ingest_rtp] RTSP packet too short: {}", data.len());
                 return Ok(());
             }
             let channel = data[1];
+            println!("[ingest_rtp] RTSP interleaved channel: {}", channel);
             // Filter RTCP channels (typically odd: 1, 3, etc.)
             if channel % 2 != 0 {
+                println!("[ingest_rtp] Skipping RTCP packet");
                 return Ok(());
             }
             &data[4..]
@@ -310,6 +316,7 @@ impl StreamSession {
 
         // Basic RTP parsing
         if rtp_packet.len() < 12 {
+            println!("[ingest_rtp] RTP packet too short: {}", rtp_packet.len());
             return Ok(());
         }
 
@@ -318,7 +325,11 @@ impl StreamSession {
             u32::from_be_bytes([rtp_packet[4], rtp_packet[5], rtp_packet[6], rtp_packet[7]]);
         let payload = &rtp_packet[12..];
 
+        println!("[ingest_rtp] RTP: marker={}, timestamp={}, payload_len={}, first byte: 0x{:02x}",
+                 marker, timestamp, payload.len(), payload.first().unwrap_or(&0));
+
         if let Some(frame) = depacketizer.push(payload)? {
+            println!("[ingest_rtp] Got frame from depacketizer, {} bytes", frame.data.len());
             // Calculate duration based on RTP timestamp diff
             let mut last_ts_guard = self.last_timestamp.lock().await;
             let duration = if let Some(last_ts) = *last_ts_guard {
@@ -343,7 +354,7 @@ impl StreamSession {
 
             // Prepend Annex B start code if it's not a STAP-A
             let nalu_type = frame.data[0] & 0x1F;
-            let final_data = if nalu_type == 24 {
+            let final_data: bytes::Bytes = if nalu_type == 24 {
                 frame.data.into()
             } else {
                 let mut d = Vec::with_capacity(frame.data.len() + 4);
@@ -352,6 +363,8 @@ impl StreamSession {
                 d.into()
             };
 
+            // Get length before the move
+            let data_len = final_data.len();
             self.track
                 .write_sample(&Sample {
                     data: final_data,
@@ -359,6 +372,9 @@ impl StreamSession {
                     ..Default::default()
                 })
                 .await?;
+            println!("[ingest_rtp] Wrote sample to track: {} bytes, duration={:?}", data_len, duration);
+        } else {
+            println!("[ingest_rtp] No frame from depacketizer (fragmented or assembling)");
         }
 
         Ok(())

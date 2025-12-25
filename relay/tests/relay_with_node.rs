@@ -1,5 +1,5 @@
 use anyhow::Result;
-use orb_node::{ControlMessage, DataMessage, Message, ProtocolHandler};
+use orb_node::{ControlMessage, DataMessage, Message};
 use orb_relay::{bridge_manager::BridgeManager, http, webrtc::WebRtcBridge};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -91,11 +91,10 @@ async fn relay_with_node() -> Result<()> {
                 let bridge_mgr_clone = Arc::clone(&bridge_manager_for_nodes);
 
                 tokio::spawn(async move {
-                    let protocol = ProtocolHandler::new(socket);
                     let mut node_id = String::new();
 
-                    // Split the protocol handler into read and write halves
-                    let (read_half, write_half) = protocol.into_split();
+                    // Split raw socket directly (NOT using ProtocolHandler)
+                    let (read_half, write_half) = socket.into_split();
                     let mut read_half = read_half;
                     let mut write_half = write_half;
 
@@ -113,6 +112,10 @@ async fn relay_with_node() -> Result<()> {
                                         break;
                                     }
                                     if write_half.write_all(&encoded).await.is_err() {
+                                        break;
+                                    }
+                                    // Flush after each message (important for reliability)
+                                    if write_half.flush().await.is_err() {
                                         break;
                                     }
                                 }
