@@ -2,6 +2,7 @@ use crate::message::{ControlMessage, Message, Service};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
@@ -36,7 +37,136 @@ impl Node {
         }
     }
 
+    /// Run the node - handles connection, registration, announcement, and message processing.
+    ///
+    /// This is the recommended way to use a Node. It replaces the fragile sequence of:
+    /// `connect()` -> sleep -> `announce()` -> spawn `process_relay_messages()`
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use orb_node::Node;
+    /// use orb_node::message::Service;
+    ///
+    /// # async fn example() -> anyhow::Result<()> {
+    /// let node = Node::new("my-node".to_string());
+    /// let services = vec![/* ... */];
+    ///
+    /// // This single call handles everything:
+    /// // - Connects to relay
+    /// // - Registers the node
+    /// // - Waits for ACK (with timeout)
+    /// // - Announces services
+    /// // - Processes messages until disconnect
+    /// node.run("127.0.0.1", 9000, services).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run(
+        &self,
+        relay_addr: &str,
+        relay_port: u16,
+        services: Vec<Service>,
+    ) -> Result<()> {
+        // Connect to relay
+        let stream = TcpStream::connect((relay_addr, relay_port)).await
+            .map_err(|e| anyhow!("Failed to connect to relay {}:{}: {}", relay_addr, relay_port, e))?;
+
+        println!("[Node] Connected to relay {}:{}", relay_addr, relay_port);
+
+        // Split the stream
+        let (mut reader, mut writer) = stream.into_split();
+
+        // Create channel for sending messages
+        let (tx, mut rx) = mpsc::channel::<Message>(100);
+        *self.relay_tx.lock().await = Some(tx);
+
+        // Spawn writer task - takes ownership of writer
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg.encode() {
+                    Ok(encoded) => {
+                        let len = encoded.len() as u32;
+                        if writer.write_all(&len.to_be_bytes()).await.is_err() {
+                            break;
+                        }
+                        if writer.write_all(&encoded).await.is_err() {
+                            break;
+                        }
+                        if writer.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Node] Failed to encode: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Send REGISTER - we need to use the relay_tx channel since writer was moved
+        let register = Message::control(ControlMessage::Register {
+            node_id: self.node_id.clone(),
+        });
+        let relay_tx = self.relay_tx.lock().await;
+        if let Some(tx) = relay_tx.as_ref() {
+            tx.send(register).await
+                .map_err(|_| anyhow!("Failed to send REGISTER"))?;
+        } else {
+            return Err(anyhow!("No relay channel available"));
+        }
+        drop(relay_tx);
+        println!("[Node] Sent REGISTER as '{}'", self.node_id);
+
+        // Wait for ACK with timeout
+        let msg = tokio::time::timeout(
+            Duration::from_secs(5),
+            Self::read_single_message(&mut reader)
+        ).await
+        .map_err(|_| anyhow!("Timeout waiting for ACK from relay"))??;
+
+        match msg {
+            Message::Control {
+                control: ControlMessage::Ack { .. },
+                ..
+            } => {
+                println!("[Node] Received REGISTER ACK");
+            }
+            _ => {
+                return Err(anyhow!("Expected ACK, got {:?}", msg));
+            }
+        }
+
+        // Announce services
+        *self.announced_services.lock().await = services.clone();
+        let announce = Message::control(ControlMessage::Announce { services });
+        let relay_tx = self.relay_tx.lock().await;
+        if let Some(tx) = relay_tx.as_ref() {
+            tx.send(announce).await
+                .map_err(|_| anyhow!("Failed to send ANNOUNCE"))?;
+        } else {
+            return Err(anyhow!("No relay channel available"));
+        }
+        drop(relay_tx);
+        println!("[Node] Sent ANNOUNCE");
+
+        // Process messages until disconnect
+        let self_rc = Arc::new(self.clone_for_task());
+        println!("[Node] Listening for messages from relay");
+
+        loop {
+            let msg = Self::read_single_message(&mut reader).await?;
+            if let Err(e) = self_rc.handle_message(msg).await {
+                eprintln!("[Node] Error handling message: {}", e);
+            }
+        }
+    }
+
     /// Connect to the relay and start the control connection
+    ///
+    /// **Deprecated:** Use `run()` instead. This method will be made private in a future release.
+    #[allow(dead_code)]
     pub async fn connect(&self, relay_addr: &str, relay_port: u16) -> Result<()> {
         let stream = TcpStream::connect((relay_addr, relay_port)).await?;
         *self.relay_stream.lock().await = Some(stream);
@@ -48,6 +178,9 @@ impl Node {
     }
 
     /// Announce services to the relay
+    ///
+    /// **Deprecated:** Use `run()` instead. This method will be made private in a future release.
+    #[allow(dead_code)]
     pub async fn announce(&self, services: Vec<Service>) -> Result<()> {
         let msg = Message::control(ControlMessage::Announce {
             services: services.clone(),
@@ -91,6 +224,9 @@ impl Node {
     }
 
     /// Process messages from the relay connection
+    ///
+    /// **Deprecated:** Use `run()` instead. This method will be made private in a future release.
+    #[allow(dead_code)]
     pub async fn process_relay_messages(&self) -> Result<()> {
         println!("[Node] Starting process_relay_messages");
         let mut relay_stream = self.relay_stream.lock().await;
@@ -120,6 +256,11 @@ impl Node {
                         }
                         if writer.write_all(&encoded).await.is_err() {
                             eprintln!("[Node] Writer task failed to write message");
+                            break;
+                        }
+                        // Flush after each message (important for reliability)
+                        if writer.flush().await.is_err() {
+                            eprintln!("[Node] Writer task failed to flush");
                             break;
                         }
                         println!("[Node] Writer task sent message successfully");
@@ -181,6 +322,35 @@ impl Node {
 
     // Private helper methods
 
+    async fn read_single_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Message> {
+        let mut len_buf = [0u8; 4];
+        reader.read_exact(&mut len_buf).await
+            .map_err(|e| anyhow!("Failed to read message length: {}", e))?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > 1024 * 1024 {
+            return Err(anyhow!("Message too large: {} bytes", len));
+        }
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await
+            .map_err(|e| anyhow!("Failed to read message body: {}", e))?;
+        Ok(Message::decode(&buf)?)
+    }
+
+    /// Write a message directly to a writer (for initial handshake before channel is set up)
+    #[allow(dead_code)]
+    async fn write_message_direct<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &Message) -> Result<()> {
+        let encoded = msg.encode()?;
+        let len = encoded.len() as u32;
+        writer.write_all(&len.to_be_bytes()).await
+            .map_err(|e| anyhow!("Failed to write length: {}", e))?;
+        writer.write_all(&encoded).await
+            .map_err(|e| anyhow!("Failed to write message: {}", e))?;
+        writer.flush().await
+            .map_err(|e| anyhow!("Failed to flush: {}", e))?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     async fn send_register(&self) -> Result<()> {
         let msg = Message::control(ControlMessage::Register {
             node_id: self.node_id.clone(),
@@ -210,6 +380,8 @@ impl Node {
             stream.write_all(&len.to_be_bytes()).await?;
             // Write message
             stream.write_all(&encoded).await?;
+            // Flush to ensure message is sent
+            stream.flush().await?;
         } else {
             return Err(anyhow!("No relay connection"));
         }

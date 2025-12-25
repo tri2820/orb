@@ -1,11 +1,14 @@
 use anyhow::{anyhow, Result};
-use orb_node::{ControlMessage, Message, Service};
+use orb_node::{ControlMessage, DataMessage, Message, Service};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 use crate::bridge_stream::BridgeStream;
+use crate::webrtc::WebRtcBridge;
 
 /// Manages bridge connections between relay and nodes
 pub struct BridgeManager {
@@ -145,6 +148,160 @@ impl BridgeManager {
 
         println!("[BridgeManager] Closed bridge {}", bridge_id);
         Ok(())
+    }
+
+    /// Handle a node connection - all protocol logic lives here.
+    ///
+    /// This method:
+    /// 1. Splits the socket into read/write halves
+    /// 2. Creates a writer task with auto-flush (prevents the "silent bug")
+    /// 3. Reads and handles messages (Register, Announce, Data, etc.)
+    /// 4. Sends ACKs for non-ACK messages
+    pub async fn handle_node(
+        &self,
+        socket: TcpStream,
+        webrtc_bridge: Arc<WebRtcBridge>,
+    ) -> Result<()> {
+        let mut node_id = String::new();
+
+        // Split socket into read/write halves
+        let (read_half, write_half) = socket.into_split();
+        let mut read_half = tokio::io::BufReader::new(read_half);
+        let mut write_half = tokio::io::BufWriter::new(write_half);
+
+        // Create channel for sending messages to the node
+        let (tx, mut rx) = mpsc::channel::<Message>(100);
+
+        // Spawn writer task with auto-flush
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg.encode() {
+                    Ok(encoded) => {
+                        let len = encoded.len() as u32;
+                        if write_half.write_all(&len.to_be_bytes()).await.is_err() {
+                            break;
+                        }
+                        if write_half.write_all(&encoded).await.is_err() {
+                            break;
+                        }
+                        // Flush after each message (important for reliability)
+                        if write_half.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[BridgeManager] Failed to encode: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Message loop
+        loop {
+            let msg_result = Self::read_message(&mut read_half).await;
+
+            match msg_result {
+                Ok(Some(msg)) => {
+                    // Don't send ACK for ACK messages (would cause infinite loop)
+                    let is_ack = matches!(msg, Message::Control { control: ControlMessage::Ack { .. }, .. });
+
+                    // Extract msg_id from message for ACK
+                    let msg_id = msg.msg_id().to_string();
+
+                    match msg {
+                        Message::Control {
+                            control: ControlMessage::Register { node_id: nid },
+                            ..
+                        } => {
+                            node_id = nid.clone();
+                            println!("[BridgeManager] Node registered: {}", nid);
+                            self.register_node(node_id.clone(), tx.clone()).await;
+                        }
+                        Message::Control {
+                            control: ControlMessage::Announce { services },
+                            ..
+                        } => {
+                            println!(
+                                "[BridgeManager] Received announce from {}: {} services",
+                                node_id,
+                                services.len()
+                            );
+
+                            for svc in &services {
+                                println!(
+                                    "  - Service: {} | Type: {} | Addr: {}:{}",
+                                    svc.id, svc.svc_type, svc.addr, svc.port
+                                );
+                            }
+
+                            // Register services with WebRTC bridge
+                            if let Err(e) = webrtc_bridge.register_services(&node_id, services).await {
+                                eprintln!("[BridgeManager] Failed to register services: {}", e);
+                            } else {
+                                println!("[BridgeManager] Services registered and available for WebRTC");
+                            }
+                        }
+                        Message::Data {
+                            data: DataMessage { bridge_id, payload },
+                            ..
+                        } => {
+                            // Forward data to the bridge
+                            if let Err(e) = self.handle_data(bridge_id, payload).await {
+                                eprintln!("[BridgeManager] Failed to handle data: {}", e);
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // Send ACK for non-ACK messages
+                    if !is_ack {
+                        let ack = Message::ack(msg_id);
+                        let _ = tx.send(ack).await;
+                    }
+                }
+                Ok(None) => {
+                    println!("[BridgeManager] Node {} disconnected", node_id);
+                    if !node_id.is_empty() {
+                        webrtc_bridge.unregister_node(&node_id).await;
+                        self.unregister_node(&node_id).await;
+                    }
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[BridgeManager] Error receiving from node: {}", e);
+                    if !node_id.is_empty() {
+                        webrtc_bridge.unregister_node(&node_id).await;
+                        self.unregister_node(&node_id).await;
+                    }
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read a single length-prefixed message from a reader
+    async fn read_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Option<Message>> {
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf).await {
+            Ok(0) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(anyhow!("Failed to read message length: {}", e)),
+            Ok(_) => {}
+        }
+
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > 1024 * 1024 {
+            return Err(anyhow!("Message too large: {} bytes", len));
+        }
+
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf).await?;
+
+        let msg = Message::decode(&buf)?;
+        Ok(Some(msg))
     }
 }
 

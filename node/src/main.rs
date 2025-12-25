@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use orb_node::{AllowList, ControlMessage, Message, ProtocolHandler};
+use orb_node::{AllowList, Node};
 use std::path::PathBuf;
-use tokio::net::TcpStream;
 
 #[derive(Parser)]
 struct Args {
@@ -47,85 +46,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Connect to relay
-    println!(
-        "[Node] Connecting to relay at {}:{}",
-        args.relay_addr, args.relay_port
-    );
-    let stream = TcpStream::connect((args.relay_addr.as_str(), args.relay_port)).await?;
-    let mut protocol = ProtocolHandler::new(stream);
-    println!("[Node] Connected to relay");
-
-    // Send REGISTER
-    let register = Message::control(ControlMessage::Register {
-        node_id: node_id.clone(),
-    });
-    protocol.send(&register).await?;
-    println!("[Node] Sent REGISTER as '{}'", node_id);
-
-    // Wait for ACK to REGISTER before sending ANNOUNCE
-    loop {
-        match protocol.recv().await {
-            Ok(Some(msg)) => {
-                match &msg {
-                    Message::Control { control: ControlMessage::Ack { .. }, .. } => {
-                        println!("[Node] Received REGISTER ACK");
-                        break;
-                    }
-                    _ => {
-                        println!("[Node] Received unexpected message before ACK: {:?}", msg);
-                    }
-                }
-            }
-            Ok(None) => {
-                eprintln!("[Node] Relay closed connection before ACK");
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("[Node] Error waiting for ACK: {}", e);
-                return Ok(());
-            }
-        }
-    }
-
-    // Send ANNOUNCE
-    println!(
-        "[Node] Announcing services: {:?}",
-        allowlist.services.iter().map(|s| &s.id).collect::<Vec<_>>()
-    );
-    let announce = Message::control(ControlMessage::Announce {
-        services: allowlist.services,
-    });
-    protocol.send(&announce).await?;
-    println!("[Node] Sent ANNOUNCE");
-
-    // Listen for messages from relay
-    println!("[Node] Listening for messages from relay (Ctrl+C to quit)");
-    loop {
-        match protocol.recv().await {
-            Ok(Some(msg)) => {
-                println!("[Node] Received: {:?}", msg);
-
-                // Send ACK for control messages (but not ACKs themselves)
-                if matches!(msg, Message::Control { control: ControlMessage::Ack { .. }, .. }) {
-                    // Don't ACK ACKs - would cause infinite loop
-                } else if let Message::Control { .. } = msg {
-                    let ack = Message::ack(msg.msg_id().to_string());
-                    if let Err(e) = protocol.send(&ack).await {
-                        eprintln!("[Node] Failed to send ACK: {}", e);
-                    }
-                }
-            }
-            Ok(None) => {
-                println!("[Node] Relay closed connection");
-                break;
-            }
-            Err(e) => {
-                eprintln!("[Node] Error: {}", e);
-                break;
-            }
-        }
-    }
+    // Create node and run
+    let node = Node::new(node_id);
+    node.run(&args.relay_addr, args.relay_port, allowlist.services).await?;
 
     Ok(())
 }

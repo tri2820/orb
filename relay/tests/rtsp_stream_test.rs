@@ -1,10 +1,9 @@
 use anyhow::Result;
-use orb_node::{Auth, ControlMessage, DataMessage, Message, Service};
+use orb_node::{Auth, Service, Node};
 use orb_relay::{bridge_manager::BridgeManager, webrtc::WebRtcBridge};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
 /// Test RTSP streaming through bridge with real camera
@@ -26,34 +25,17 @@ async fn test_rtsp_bridge_with_real_camera() -> Result<()> {
     let relay_addr = relay_listener.local_addr()?;
     println!("[Test] Relay listening on {}", relay_addr);
 
-    // Spawn relay handler
+    // Spawn relay handler using the new handle_node method
     let bridge_mgr_clone = Arc::clone(&bridge_manager);
     let webrtc_clone = Arc::clone(&webrtc_bridge);
     tokio::spawn(async move {
         if let Ok((socket, _)) = relay_listener.accept().await {
             println!("[Relay] Node connected");
-            handle_node_connection(socket, webrtc_clone, bridge_mgr_clone).await;
+            let _ = bridge_mgr_clone.handle_node(socket, webrtc_clone).await;
         }
     });
 
-    // Create and connect node
-    let node = orb_node::Node::new("rtsp-test-node".to_string());
-    node.connect(&relay_addr.ip().to_string(), relay_addr.port())
-        .await?;
-    println!("[Node] Connected to relay");
-
-    // Spawn node message handler
-    let node_clone = node.clone();
-    tokio::spawn(async move {
-        if let Err(e) = node_clone.process_relay_messages().await {
-            eprintln!("[Node] Error processing messages: {}", e);
-        }
-    });
-
-    // Give handler time to start
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Real camera service from config
+    // Real camera service
     let camera_service = Service {
         id: "rtsp-camera".to_string(),
         svc_type: "rtsp".to_string(),
@@ -66,13 +48,28 @@ async fn test_rtsp_bridge_with_real_camera() -> Result<()> {
         }),
     };
 
-    // Announce the camera service
-    node.announce(vec![camera_service.clone()]).await?;
-    println!("[Node] Announced RTSP camera service");
+    // Clone camera service for use after spawn
+    let camera_service_for_bridge = camera_service.clone();
+    let relay_addr_str = relay_addr.ip().to_string();
+
+    // Create node using the new run() API
+    let node = Node::new("rtsp-test-node".to_string());
+    let node_handle = tokio::spawn(async move {
+        let _ = node.run(
+            &relay_addr_str,
+            relay_addr.port(),
+            vec![camera_service]
+        ).await;
+    });
+
+    println!("[Node] Connecting to relay with RTSP camera service");
+
+    // Give the node time to connect and announce
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Register with WebRTC bridge
     webrtc_bridge
-        .register_services("rtsp-test-node", vec![camera_service.clone()])
+        .register_services("rtsp-test-node", vec![camera_service_for_bridge.clone()])
         .await?;
     println!("[Test] Service registered with WebRTC bridge");
 
@@ -81,7 +78,7 @@ async fn test_rtsp_bridge_with_real_camera() -> Result<()> {
     // Create a bridge to the camera
     println!("\n[Test] Creating bridge to camera...");
     let bridge_stream = bridge_manager
-        .create_bridge("rtsp-test-node", &camera_service)
+        .create_bridge("rtsp-test-node", &camera_service_for_bridge)
         .await?;
     println!("[Test] ✓ Bridge created: {}", bridge_stream.bridge_id());
 
@@ -279,148 +276,8 @@ async fn test_rtsp_bridge_with_real_camera() -> Result<()> {
         println!("[Test] ⚠️  WARNING: No RTP data received (but RTSP handshake worked)");
     }
 
+    // Clean up
+    node_handle.abort();
+
     Ok(())
-}
-
-// Helper function to handle node connections
-async fn handle_node_connection(
-    socket: tokio::net::TcpStream,
-    webrtc_bridge: Arc<WebRtcBridge>,
-    bridge_manager: Arc<BridgeManager>,
-) {
-    let mut node_id = String::new();
-
-    let (read_half, write_half) = socket.into_split();
-    let mut read_half = read_half;
-    let mut write_half = write_half;
-
-    let (tx, mut rx) = mpsc::channel::<Message>(100);
-
-    tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        println!("[Relay Handler] Sender task started");
-        while let Some(msg) = rx.recv().await {
-            println!("[Relay Handler] Sending to node: {:?}", msg);
-            match msg.encode() {
-                Ok(encoded) => {
-                    let len = encoded.len() as u32;
-                    if write_half.write_all(&len.to_be_bytes()).await.is_err() {
-                        eprintln!("[Relay Handler] Failed to write length");
-                        break;
-                    }
-                    if write_half.write_all(&encoded).await.is_err() {
-                        eprintln!("[Relay Handler] Failed to write message");
-                        break;
-                    }
-                    if write_half.flush().await.is_err() {
-                        eprintln!("[Relay Handler] Failed to flush");
-                        break;
-                    }
-                    println!("[Relay Handler] Message sent and flushed");
-                }
-                Err(e) => {
-                    eprintln!("[Relay Handler] Encode error: {}", e);
-                    break;
-                }
-            }
-        }
-        println!("[Relay Handler] Sender task ended");
-    });
-
-    println!("[Relay Handler] Entering message loop");
-    loop {
-        use tokio::io::AsyncReadExt;
-        let msg_result = async {
-            let mut len_buf = [0u8; 4];
-            match read_half.read_exact(&mut len_buf).await {
-                Ok(0) => return Ok(None),
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                Err(e) => return Err(anyhow::anyhow!("Failed to read: {}", e)),
-                Ok(_) => {}
-            }
-
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len > 1024 * 1024 {
-                return Err(anyhow::anyhow!("Message too large"));
-            }
-
-            let mut buf = vec![0u8; len];
-            read_half.read_exact(&mut buf).await?;
-
-            let msg = Message::decode(&buf)?;
-            Ok(Some(msg))
-        }
-        .await;
-
-        match msg_result {
-            Ok(Some(msg)) => {
-                println!("[Relay Handler] Received from node: {:?}", msg);
-                let is_ack = matches!(
-                    msg,
-                    Message::Control {
-                        control: ControlMessage::Ack { .. },
-                        ..
-                    }
-                );
-                let msg_id = msg.msg_id().to_string();
-
-                match msg {
-                    Message::Control {
-                        control: ControlMessage::Register { node_id: nid },
-                        ..
-                    } => {
-                        node_id = nid.clone();
-                        println!("[Relay Handler] Registering node: {}", node_id);
-                        bridge_manager
-                            .register_node(node_id.clone(), tx.clone())
-                            .await;
-                    }
-                    Message::Control {
-                        control: ControlMessage::Announce { services },
-                        ..
-                    } => {
-                        println!(
-                            "[Relay Handler] Received ANNOUNCE with {} services",
-                            services.len()
-                        );
-                        let _ = webrtc_bridge.register_services(&node_id, services).await;
-                    }
-                    Message::Data {
-                        data: DataMessage { bridge_id, payload },
-                        ..
-                    } => {
-                        println!(
-                            "[Relay Handler] Received DATA: bridge_id={}, {} bytes",
-                            bridge_id,
-                            payload.len()
-                        );
-                        let _ = bridge_manager.handle_data(bridge_id, payload).await;
-                    }
-                    _ => {}
-                }
-
-                if !is_ack {
-                    let ack = Message::ack(msg_id);
-                    let _ = tx.send(ack).await;
-                }
-            }
-            Ok(None) => {
-                println!("[Relay Handler] Node disconnected");
-                if !node_id.is_empty() {
-                    webrtc_bridge.unregister_node(&node_id).await;
-                    bridge_manager.unregister_node(&node_id).await;
-                }
-                break;
-            }
-            Err(e) => {
-                eprintln!("[Relay Handler] Error: {}", e);
-                if !node_id.is_empty() {
-                    webrtc_bridge.unregister_node(&node_id).await;
-                    bridge_manager.unregister_node(&node_id).await;
-                }
-                break;
-            }
-        }
-    }
-    println!("[Relay Handler] Handler finished");
 }
