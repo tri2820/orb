@@ -82,6 +82,7 @@ impl Node {
         *self.relay_tx.lock().await = Some(tx);
 
         // Spawn writer task - takes ownership of writer
+        // Flush after every write for protocol reliability (prevents "silent bug")
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg.encode() {

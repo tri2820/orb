@@ -2,7 +2,7 @@
 //!
 //! This module provides wrappers that prevent common pitfalls like forgetting to flush.
 
-use tokio::io::{duplex, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 /// Wrapper that auto-flushes after every write.
 ///
@@ -99,6 +99,7 @@ impl<W: AsyncWrite + Unpin> FlushWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{duplex, AsyncReadExt};
 
     #[tokio::test]
     async fn test_flush_writer() {

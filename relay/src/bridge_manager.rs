@@ -173,6 +173,7 @@ impl BridgeManager {
         let (tx, mut rx) = mpsc::channel::<Message>(100);
 
         // Spawn writer task with auto-flush
+        // Flush after every write for protocol reliability (prevents "silent bug")
         tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg.encode() {
@@ -184,7 +185,6 @@ impl BridgeManager {
                         if write_half.write_all(&encoded).await.is_err() {
                             break;
                         }
-                        // Flush after each message (important for reliability)
                         if write_half.flush().await.is_err() {
                             break;
                         }
