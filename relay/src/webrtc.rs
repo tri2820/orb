@@ -1,9 +1,9 @@
 use crate::bridge_manager::BridgeManager;
-use crate::h264_depacketizer::H264Depacketizer;
 use crate::node_shadow::{NodeShadow, NodeShadows};
 use crate::rtsp::RtspClient;
 use anyhow::{anyhow, Result};
 use orb_node::{Auth, Service};
+use rtp::packet::Packet as RtpPacket;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -14,12 +14,12 @@ use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::ice_transport::ice_connection_state::RTCIceConnectionState;
 use webrtc::interceptor::registry::Registry;
-use webrtc::media::Sample;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-use webrtc::track::track_local::TrackLocal;
+use webrtc::track::track_local::track_local_static_rtp::TrackLocalStaticRTP;
+use webrtc::track::track_local::{TrackLocal, TrackLocalWriter};
+use webrtc_util::Unmarshal;
 
 pub struct WebRtcBridge {
     // service_id -> StreamSession
@@ -32,9 +32,7 @@ pub struct WebRtcBridge {
 
 pub struct StreamSession {
     pub service_id: String,
-    pub track: Arc<TrackLocalStaticSample>,
-    pub depacketizer: Mutex<H264Depacketizer>,
-    pub last_timestamp: Mutex<Option<u32>>,
+    pub track: Arc<TrackLocalStaticRTP>,
     pub subscriber_count: Arc<AtomicUsize>,
     pub rtp_tx: mpsc::Sender<Vec<u8>>,
 }
@@ -89,7 +87,7 @@ impl WebRtcBridge {
         // Create RTP channel for this session
         let (rtp_tx, mut rtp_rx) = mpsc::channel::<Vec<u8>>(100);
 
-        let track = Arc::new(TrackLocalStaticSample::new(
+        let track = Arc::new(TrackLocalStaticRTP::new(
             RTCRtpCodecCapability {
                 mime_type: "video/h264".to_owned(),
                 ..Default::default()
@@ -98,13 +96,9 @@ impl WebRtcBridge {
             "orb-webrtc".to_owned(),
         ));
 
-        let depacketizer = H264Depacketizer::new();
-
         let session = Arc::new(StreamSession {
             service_id: service_id.to_string(),
             track,
-            depacketizer: Mutex::new(depacketizer),
-            last_timestamp: Mutex::new(None),
             subscriber_count: Arc::new(AtomicUsize::new(0)),
             rtp_tx,
         });
@@ -138,7 +132,10 @@ impl WebRtcBridge {
         let service_id_str = service_id.to_string();
 
         // Create a bridge connection to the node
-        let bridge_stream = self.bridge_manager.create_bridge(&node_id, &service).await?;
+        let bridge_stream = self
+            .bridge_manager
+            .create_bridge(&node_id, &service)
+            .await?;
 
         tokio::spawn(async move {
             let path = if service.path.starts_with('/') {
@@ -167,7 +164,10 @@ impl WebRtcBridge {
 
             match rtsp_client.start_streaming(rtp_tx).await {
                 Ok(_) => println!("RTSP stream ended for {}", service_id_str),
-                Err(e) => eprintln!("Failed to stream from RTSP service {}: {}", service_id_str, e),
+                Err(e) => eprintln!(
+                    "Failed to stream from RTSP service {}: {}",
+                    service_id_str, e
+                ),
             }
         });
 
@@ -291,13 +291,15 @@ impl WebRtcBridge {
 
 impl StreamSession {
     async fn ingest_rtp(&self, data: Vec<u8>) -> Result<()> {
-        let mut depacketizer = self.depacketizer.lock().await;
-
         // Debug: show what we received
-        println!("[ingest_rtp] Received {} bytes, first byte: 0x{:02x}", data.len(), data.first().unwrap_or(&0));
+        println!(
+            "[ingest_rtp] Received {} bytes, first byte: 0x{:02x}",
+            data.len(),
+            data.first().unwrap_or(&0)
+        );
 
         // Detect if data is RTSP-framed ($) or raw RTP
-        let rtp_packet = if !data.is_empty() && data[0] == b'$' {
+        let rtp_bytes = if !data.is_empty() && data[0] == b'$' {
             if data.len() < 4 {
                 println!("[ingest_rtp] RTSP packet too short: {}", data.len());
                 return Ok(());
@@ -314,68 +316,27 @@ impl StreamSession {
             &data[..]
         };
 
-        // Basic RTP parsing
-        if rtp_packet.len() < 12 {
-            println!("[ingest_rtp] RTP packet too short: {}", rtp_packet.len());
+        // Basic validation
+        if rtp_bytes.len() < 12 {
+            println!("[ingest_rtp] RTP packet too short: {}", rtp_bytes.len());
             return Ok(());
         }
 
-        let marker = (rtp_packet[1] & 0x80) != 0;
-        let timestamp =
-            u32::from_be_bytes([rtp_packet[4], rtp_packet[5], rtp_packet[6], rtp_packet[7]]);
-        let payload = &rtp_packet[12..];
+        // Parse RTP packet
+        let rtp_packet = RtpPacket::unmarshal(&mut &rtp_bytes[..])?;
 
-        println!("[ingest_rtp] RTP: marker={}, timestamp={}, payload_len={}, first byte: 0x{:02x}",
-                 marker, timestamp, payload.len(), payload.first().unwrap_or(&0));
+        println!(
+            "[ingest_rtp] RTP: seq={}, timestamp={}, marker={}, payload_len={}",
+            rtp_packet.header.sequence_number,
+            rtp_packet.header.timestamp,
+            rtp_packet.header.marker,
+            rtp_packet.payload.len()
+        );
 
-        if let Some(frame) = depacketizer.push(payload)? {
-            println!("[ingest_rtp] Got frame from depacketizer, {} bytes", frame.data.len());
-            // Calculate duration based on RTP timestamp diff
-            let mut last_ts_guard = self.last_timestamp.lock().await;
-            let duration = if let Some(last_ts) = *last_ts_guard {
-                if marker {
-                    let diff = timestamp.wrapping_sub(last_ts);
-                    *last_ts_guard = Some(timestamp);
-                    // H.264 RTP timestamp clock is usually 90000Hz
-                    if diff > 0 && diff < 90000 {
-                        Duration::from_nanos((diff as u64 * 1_000_000_000) / 90000)
-                    } else {
-                        // Default to 33ms if timestamp diff is suspicious or 0
-                        Duration::from_millis(33)
-                    }
-                } else {
-                    // Not the end of a frame, use 0 duration to keep same timestamp
-                    Duration::from_millis(0)
-                }
-            } else {
-                *last_ts_guard = Some(timestamp);
-                Duration::from_millis(0)
-            };
+        // Forward RTP packet directly to WebRTC track
+        self.track.write_rtp(&rtp_packet).await?;
 
-            // Prepend Annex B start code if it's not a STAP-A
-            let nalu_type = frame.data[0] & 0x1F;
-            let final_data: bytes::Bytes = if nalu_type == 24 {
-                frame.data.into()
-            } else {
-                let mut d = Vec::with_capacity(frame.data.len() + 4);
-                d.extend_from_slice(&[0, 0, 0, 1]);
-                d.extend_from_slice(&frame.data);
-                d.into()
-            };
-
-            // Get length before the move
-            let data_len = final_data.len();
-            self.track
-                .write_sample(&Sample {
-                    data: final_data,
-                    duration,
-                    ..Default::default()
-                })
-                .await?;
-            println!("[ingest_rtp] Wrote sample to track: {} bytes, duration={:?}", data_len, duration);
-        } else {
-            println!("[ingest_rtp] No frame from depacketizer (fragmented or assembling)");
-        }
+        println!("[ingest_rtp] Forwarded RTP packet to WebRTC track");
 
         Ok(())
     }

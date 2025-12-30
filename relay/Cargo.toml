@@ -14,4 +14,6 @@ serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 warp = "0.3"
 webrtc = "0.10.0"
+rtp = "0.10.0"
+webrtc-util = "0.8.0"
 orb-node = { path = "../node" }
