@@ -20,7 +20,7 @@ type Bridge struct {
 // NodeConn handles a single node connection
 type NodeConn struct {
 	conn     *node.Conn
-	server   *Server
+	relay    *Relay
 	nodeID   string
 	bridges  map[string]*Bridge
 	bridgeMu sync.RWMutex
@@ -87,7 +87,7 @@ func (nc *NodeConn) handleRegister(msgID, nodeID string) error {
 		return fmt.Errorf("empty node_id")
 	}
 
-	nc.server.registerNode(nodeID, nc)
+	nc.relay.registerNode(nodeID, nc)
 
 	// Send ACK
 	return nc.sendAck(msgID)
@@ -101,7 +101,7 @@ func (nc *NodeConn) handleAnnounce(msgID string, services []node.Service) error 
 
 	// Register services
 	for _, svc := range services {
-		nc.server.services.Register(svc, nc.nodeID)
+		nc.relay.services.Register(svc, nc.nodeID)
 		log.Printf("[NodeConn %s] Service announced: %s (%s:%d)",
 			nc.nodeID, svc.ID, svc.Addr, svc.Port)
 	}

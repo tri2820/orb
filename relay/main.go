@@ -13,14 +13,14 @@ func main() {
 	httpAddr := flag.String("http", ":8080", "Listen address for HTTP API")
 	flag.Parse()
 
-	server := NewServer()
+	relay := NewRelay()
 
-	if err := server.Listen(*addr); err != nil {
+	if err := relay.Listen(*addr); err != nil {
 		log.Fatalf("Failed to listen: %v", err)
 	}
 
 	// Start HTTP API
-	go startHTTPAPI(server, *httpAddr)
+	go startHTTPAPI(relay, *httpAddr)
 
 	// Handle shutdown signals
 	sigChan := make(chan os.Signal, 1)
@@ -29,10 +29,10 @@ func main() {
 	go func() {
 		<-sigChan
 		log.Println("[Main] Shutting down...")
-		server.Shutdown()
+		relay.Shutdown()
 	}()
 
-	if err := server.Serve(); err != nil {
-		log.Fatalf("Server error: %v", err)
+	if err := relay.Serve(); err != nil {
+		log.Fatalf("Relay error: %v", err)
 	}
 }

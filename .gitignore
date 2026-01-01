@@ -1,7 +1,9 @@
 relay/config.json
 relay/target
+relay/bin/
 node/target
 node/allowlist.json
+node/bin/
 rust-node/
 rust-relay/
 unblink-engine/

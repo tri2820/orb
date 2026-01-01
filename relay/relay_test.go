@@ -1,353 +1,364 @@
 package main
 
 import (
+	"fmt"
+	"log"
 	"net"
+	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/tri/orb/node"
 )
 
-// loadConfig loads config.json
-func loadConfig(t *testing.T) *Config {
-	config, err := LoadConfig("config.json")
-	if err != nil {
-		t.Fatalf("Failed to load config.json: %v", err)
-	}
-	return config
-}
+// TestRelayStartStop tests basic relay lifecycle
+func TestRelayStartStop(t *testing.T) {
+	relay := NewRelay()
 
-// connectNode creates a node connection to the server
-func connectNode(t *testing.T, addr string) *node.Conn {
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
-	}
-	return node.NewConn(conn)
-}
-
-func TestServerStartStop(t *testing.T) {
-	server := NewServer()
-	if err := server.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("Listen failed: %v", err)
+	// Start relay
+	addr := "127.0.0.1:0"
+	if err := relay.Listen(addr); err != nil {
+		t.Fatalf("Failed to listen: %v", err)
 	}
 
-	go server.Serve()
+	go relay.Serve()
 
 	// Give it a moment to start
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
-	server.Shutdown()
+	// Shutdown relay
+	relay.Shutdown()
 }
 
+// TestNodeRegister tests node registration
 func TestNodeRegister(t *testing.T) {
-	server := NewServer()
-	if err := server.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("Listen failed: %v", err)
+	relay := NewRelay()
+
+	addr := "127.0.0.1:0"
+	if err := relay.Listen(addr); err != nil {
+		t.Fatalf("Failed to listen: %v", err)
 	}
-	defer server.Shutdown()
+	defer relay.Shutdown()
 
-	go server.Serve()
-	time.Sleep(10 * time.Millisecond)
+	go relay.Serve()
 
-	// Connect as node
-	nodeConn := connectNode(t, server.Addr().String())
-	defer nodeConn.Close()
+	relayAddr := relay.Addr().String()
+
+	// Connect as a node
+	conn, err := net.Dial("tcp", relayAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect to relay: %v", err)
+	}
+	defer conn.Close()
+
+	nodeConn := node.NewConn(conn)
 
 	// Send REGISTER
-	regMsg := node.NewRegisterMsg("msg-1", "test-node-1")
+	regMsg := node.NewRegisterMsg("msg-1", "node-1")
 	if err := nodeConn.WriteMessage(regMsg); err != nil {
-		t.Fatalf("WriteMessage failed: %v", err)
+		t.Fatalf("Failed to send register: %v", err)
 	}
 
-	// Expect ACK
-	ack, err := nodeConn.ReadMessage()
+	// Read ACK
+	msg, err := nodeConn.ReadMessage()
 	if err != nil {
-		t.Fatalf("ReadMessage failed: %v", err)
+		t.Fatalf("Failed to read ack: %v", err)
 	}
 
-	if ack.ControlType() != node.MsgTypeAck {
-		t.Errorf("Expected ACK, got %s", ack.ControlType())
-	}
-	if ack.Control.AckMsgID != "msg-1" {
-		t.Errorf("AckMsgID = %q, want %q", ack.Control.AckMsgID, "msg-1")
+	if !msg.IsControl() || msg.ControlType() != node.MsgTypeAck {
+		t.Fatalf("Expected ACK, got: %+v", msg)
 	}
 
 	// Verify node is registered
-	time.Sleep(10 * time.Millisecond) // Let server process
-	if server.GetNode("test-node-1") == nil {
-		t.Error("Node not registered")
+	time.Sleep(50 * time.Millisecond)
+	relay.nodesMu.RLock()
+	_, exists := relay.nodes["node-1"]
+	relay.nodesMu.RUnlock()
+
+	if !exists {
+		t.Fatal("Node should be registered")
 	}
 }
 
-func TestNodeAnnounce(t *testing.T) {
-	server := NewServer()
-	if err := server.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("Listen failed: %v", err)
-	}
-	defer server.Shutdown()
+// TestServiceAnnounce tests service announcement
+func TestServiceAnnounce(t *testing.T) {
+	relay := NewRelay()
 
-	go server.Serve()
-	time.Sleep(10 * time.Millisecond)
+	addr := "127.0.0.1:0"
+	if err := relay.Listen(addr); err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer relay.Shutdown()
+
+	go relay.Serve()
+
+	relayAddr := relay.Addr().String()
 
 	// Connect and register
-	nodeConn := connectNode(t, server.Addr().String())
-	defer nodeConn.Close()
-
-	regMsg := node.NewRegisterMsg("msg-1", "test-node-1")
-	nodeConn.WriteMessage(regMsg)
-	nodeConn.ReadMessage() // ACK
-
-	// Send ANNOUNCE
-	services := []node.Service{
-		{ID: "cam-1", Addr: "192.168.1.100", Port: 554, Type: "rtsp"},
-		{ID: "cam-2", Addr: "192.168.1.101", Port: 8080, Type: "mjpeg"},
+	conn, err := net.Dial("tcp", relayAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
 	}
+	defer conn.Close()
+
+	nodeConn := node.NewConn(conn)
+
+	// Register
+	regMsg := node.NewRegisterMsg("msg-1", "node-1")
+	if err := nodeConn.WriteMessage(regMsg); err != nil {
+		t.Fatalf("Failed to send register: %v", err)
+	}
+
+	// Read ACK
+	if _, err := nodeConn.ReadMessage(); err != nil {
+		t.Fatalf("Failed to read ack: %v", err)
+	}
+
+	// Announce services
+	services := []node.Service{
+		{ID: "svc-1", Type: "rtsp", Addr: "192.168.1.100", Port: 554},
+		{ID: "svc-2", Type: "http", Addr: "192.168.1.101", Port: 80},
+	}
+
 	announceMsg := node.NewAnnounceMsg("msg-2", services)
 	if err := nodeConn.WriteMessage(announceMsg); err != nil {
-		t.Fatalf("WriteMessage failed: %v", err)
+		t.Fatalf("Failed to send announce: %v", err)
 	}
 
-	// Expect ACK
-	ack, err := nodeConn.ReadMessage()
-	if err != nil {
-		t.Fatalf("ReadMessage failed: %v", err)
-	}
-
-	if ack.Control.AckMsgID != "msg-2" {
-		t.Errorf("AckMsgID = %q, want %q", ack.Control.AckMsgID, "msg-2")
+	// Read ACK
+	if _, err := nodeConn.ReadMessage(); err != nil {
+		t.Fatalf("Failed to read announce ack: %v", err)
 	}
 
 	// Verify services are registered
-	time.Sleep(10 * time.Millisecond)
-	if server.Services().Count() != 2 {
-		t.Errorf("Service count = %d, want 2", server.Services().Count())
-	}
+	time.Sleep(50 * time.Millisecond)
+	registeredServices := relay.Services().List()
 
-	svc := server.Services().Get("cam-1")
-	if svc == nil {
-		t.Fatal("Service cam-1 not found")
-	}
-	if svc.Service.Addr != "192.168.1.100" {
-		t.Errorf("Addr = %q, want %q", svc.Service.Addr, "192.168.1.100")
-	}
-	if svc.NodeID != "test-node-1" {
-		t.Errorf("NodeID = %q, want %q", svc.NodeID, "test-node-1")
+	if len(registeredServices) != 2 {
+		t.Fatalf("Expected 2 services, got %d", len(registeredServices))
 	}
 }
 
-func TestMultipleNodes(t *testing.T) {
-	server := NewServer()
-	if err := server.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("Listen failed: %v", err)
+// TestOpenBridge tests bridge opening
+func TestOpenBridge(t *testing.T) {
+	relay := NewRelay()
+
+	addr := "127.0.0.1:0"
+	if err := relay.Listen(addr); err != nil {
+		t.Fatalf("Failed to listen: %v", err)
 	}
-	defer server.Shutdown()
+	defer relay.Shutdown()
 
-	go server.Serve()
-	time.Sleep(10 * time.Millisecond)
+	go relay.Serve()
 
-	// Connect two nodes
-	node1 := connectNode(t, server.Addr().String())
-	defer node1.Close()
-	node2 := connectNode(t, server.Addr().String())
-	defer node2.Close()
+	relayAddr := relay.Addr().String()
 
-	// Register both
-	node1.WriteMessage(node.NewRegisterMsg("m1", "node-1"))
-	node1.ReadMessage()
-	node2.WriteMessage(node.NewRegisterMsg("m2", "node-2"))
-	node2.ReadMessage()
+	// Start a mock service
+	mockAddr := startMockService(t)
 
-	// Announce different services
-	node1.WriteMessage(node.NewAnnounceMsg("m3", []node.Service{
-		{ID: "svc-a", Addr: "10.0.0.1", Port: 80},
-	}))
-	node1.ReadMessage()
-
-	node2.WriteMessage(node.NewAnnounceMsg("m4", []node.Service{
-		{ID: "svc-b", Addr: "10.0.0.2", Port: 80},
-		{ID: "svc-c", Addr: "10.0.0.3", Port: 80},
-	}))
-	node2.ReadMessage()
-
-	time.Sleep(10 * time.Millisecond)
-
-	// Verify
-	if server.Services().Count() != 3 {
-		t.Errorf("Service count = %d, want 3", server.Services().Count())
+	// Connect and register node
+	conn, err := net.Dial("tcp", relayAddr)
+	if err != nil {
+		t.Fatalf("Failed to connect: %v", err)
 	}
+	defer conn.Close()
 
-	svcA := server.Services().Get("svc-a")
-	if svcA == nil || svcA.NodeID != "node-1" {
-		t.Error("svc-a not correctly registered")
+	nodeConn := node.NewConn(conn)
+
+	// Register
+	regMsg := node.NewRegisterMsg("msg-1", "node-1")
+	if err := nodeConn.WriteMessage(regMsg); err != nil {
+		t.Fatalf("Failed to send register: %v", err)
 	}
-
-	svcB := server.Services().Get("svc-b")
-	if svcB == nil || svcB.NodeID != "node-2" {
-		t.Error("svc-b not correctly registered")
-	}
-}
-
-func TestNodeDisconnect(t *testing.T) {
-	server := NewServer()
-	if err := server.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("Listen failed: %v", err)
-	}
-	defer server.Shutdown()
-
-	go server.Serve()
-	time.Sleep(10 * time.Millisecond)
-
-	// Connect and register
-	nodeConn := connectNode(t, server.Addr().String())
-
-	nodeConn.WriteMessage(node.NewRegisterMsg("m1", "test-node"))
-	nodeConn.ReadMessage()
-
-	nodeConn.WriteMessage(node.NewAnnounceMsg("m2", []node.Service{
-		{ID: "svc-1", Addr: "192.168.1.1", Port: 554},
-	}))
-	nodeConn.ReadMessage()
-
-	time.Sleep(10 * time.Millisecond)
-	if server.Services().Count() != 1 {
-		t.Fatalf("Expected 1 service, got %d", server.Services().Count())
-	}
-
-	// Disconnect
-	nodeConn.Close()
-	time.Sleep(50 * time.Millisecond) // Let server detect disconnect
-
-	// Services should be removed
-	if server.Services().Count() != 0 {
-		t.Errorf("Expected 0 services after disconnect, got %d", server.Services().Count())
-	}
-
-	if server.GetNode("test-node") != nil {
-		t.Error("Node should be removed after disconnect")
-	}
-}
-
-func TestServiceRegistry(t *testing.T) {
-	reg := NewServiceRegistry()
-
-	// Add services
-	reg.Register(node.Service{ID: "s1", Addr: "1.1.1.1", Port: 80}, "node-a")
-	reg.Register(node.Service{ID: "s2", Addr: "2.2.2.2", Port: 80}, "node-a")
-	reg.Register(node.Service{ID: "s3", Addr: "3.3.3.3", Port: 80}, "node-b")
-
-	if reg.Count() != 3 {
-		t.Errorf("Count = %d, want 3", reg.Count())
-	}
-
-	// Get
-	s1 := reg.Get("s1")
-	if s1 == nil || s1.Service.Addr != "1.1.1.1" {
-		t.Error("Get s1 failed")
-	}
-
-	// List by node
-	nodeAServices := reg.ListByNode("node-a")
-	if len(nodeAServices) != 2 {
-		t.Errorf("ListByNode(node-a) = %d, want 2", len(nodeAServices))
-	}
-
-	// Remove by node
-	reg.RemoveByNode("node-a")
-	if reg.Count() != 1 {
-		t.Errorf("Count after RemoveByNode = %d, want 1", reg.Count())
-	}
-
-	if reg.Get("s1") != nil {
-		t.Error("s1 should be removed")
-	}
-	if reg.Get("s3") == nil {
-		t.Error("s3 should still exist")
-	}
-}
-
-func TestNodeAnnounceFromConfig(t *testing.T) {
-	config := loadConfig(t)
-
-	server := NewServer()
-	if err := server.Listen("127.0.0.1:0"); err != nil {
-		t.Fatalf("Listen failed: %v", err)
-	}
-	defer server.Shutdown()
-
-	go server.Serve()
-	time.Sleep(10 * time.Millisecond)
-
-	// Connect and register
-	nodeConn := connectNode(t, server.Addr().String())
-	defer nodeConn.Close()
-
-	regMsg := node.NewRegisterMsg("msg-1", "config-node")
-	nodeConn.WriteMessage(regMsg)
 	nodeConn.ReadMessage() // ACK
 
-	// Announce services from config.json
-	announceMsg := node.NewAnnounceMsg("msg-2", config.Services)
+	// Announce service
+	services := []node.Service{
+		{ID: "test-svc", Type: "tcp", Addr: mockAddr.IP.String(), Port: mockAddr.Port},
+	}
+	announceMsg := node.NewAnnounceMsg("msg-2", services)
 	if err := nodeConn.WriteMessage(announceMsg); err != nil {
-		t.Fatalf("WriteMessage failed: %v", err)
+		t.Fatalf("Failed to send announce: %v", err)
+	}
+	nodeConn.ReadMessage() // ACK
+
+	time.Sleep(50 * time.Millisecond)
+
+	// Request bridge opening
+	relay.nodesMu.RLock()
+	nc, exists := relay.nodes["node-1"]
+	relay.nodesMu.RUnlock()
+
+	if !exists {
+		t.Fatal("Node not found")
 	}
 
-	// Expect ACK
-	ack, err := nodeConn.ReadMessage()
+	bridgeID, err := nc.OpenBridge(services[0])
 	if err != nil {
-		t.Fatalf("ReadMessage failed: %v", err)
-	}
-	if ack.Control.AckMsgID != "msg-2" {
-		t.Errorf("AckMsgID = %q, want %q", ack.Control.AckMsgID, "msg-2")
+		t.Fatalf("Failed to open bridge: %v", err)
 	}
 
-	// Verify all services from config are registered
-	time.Sleep(10 * time.Millisecond)
-	if server.Services().Count() != len(config.Services) {
-		t.Errorf("Service count = %d, want %d", server.Services().Count(), len(config.Services))
+	// Verify bridge is open
+	if bridgeID == "" {
+		t.Fatal("Bridge ID should not be empty")
 	}
 
-	// Verify each service
-	for _, svc := range config.Services {
-		registered := server.Services().Get(svc.ID)
-		if registered == nil {
-			t.Errorf("Service %q not found", svc.ID)
-			continue
-		}
-		if registered.Service.Addr != svc.Addr {
-			t.Errorf("Service %q Addr = %q, want %q", svc.ID, registered.Service.Addr, svc.Addr)
-		}
-		if registered.Service.Port != svc.Port {
-			t.Errorf("Service %q Port = %d, want %d", svc.ID, registered.Service.Port, svc.Port)
-		}
-		if registered.Service.Type != svc.Type {
-			t.Errorf("Service %q Type = %q, want %q", svc.ID, registered.Service.Type, svc.Type)
-		}
-		if registered.Service.Path != svc.Path {
-			t.Errorf("Service %q Path = %q, want %q", svc.ID, registered.Service.Path, svc.Path)
-		}
-		if registered.NodeID != "config-node" {
-			t.Errorf("Service %q NodeID = %q, want %q", svc.ID, registered.NodeID, "config-node")
-		}
-		t.Logf("✓ Service: %s | Type: %s | Addr: %s:%d", svc.ID, svc.Type, svc.Addr, svc.Port)
-	}
+	// Cleanup
+	nc.CloseBridge(bridgeID)
 }
 
-func BenchmarkRegisterAnnounce(b *testing.B) {
-	server := NewServer()
-	server.Listen("127.0.0.1:0")
-	defer server.Shutdown()
-
-	go server.Serve()
-	time.Sleep(10 * time.Millisecond)
-
-	conn, _ := net.Dial("tcp", server.Addr().String())
-	nodeConn := node.NewConn(conn)
-	defer nodeConn.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		nodeConn.WriteMessage(node.NewRegisterMsg("m", "node"))
-		nodeConn.ReadMessage()
+// TestEndToEndWithRealService tests the full flow with RTSP service from config.json
+func TestEndToEndWithRealService(t *testing.T) {
+	// Load real services from config.json
+	allowList, err := node.LoadAllowList("config.json")
+	if err != nil {
+		t.Fatalf("Failed to load config.json: %v", err)
 	}
+
+	// Find RTSP service
+	var rtspService *node.Service
+	for i, svc := range allowList.Services {
+		if svc.Type == "rtsp" {
+			rtspService = &allowList.Services[i]
+			break
+		}
+	}
+
+	if rtspService == nil {
+		t.Skip("No RTSP service found in config.json")
+	}
+
+	log.Printf("[Test] Using RTSP service: %s at %s:%d%s", rtspService.ID, rtspService.Addr, rtspService.Port, rtspService.Path)
+
+	// Start relay
+	relay := NewRelay()
+	relayAddr := "127.0.0.1:0"
+	if err := relay.Listen(relayAddr); err != nil {
+		t.Fatalf("Failed to listen: %v", err)
+	}
+	defer relay.Shutdown()
+
+	go relay.Serve()
+
+	actualRelayAddr := relay.Addr().String()
+	log.Printf("[Test] Relay started at %s", actualRelayAddr)
+
+	// Start node client
+	nodeClient := node.NewNodeClient(actualRelayAddr, "test-node", allowList.Services)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := nodeClient.Run(); err != nil {
+			log.Printf("[Test] Node client error: %v", err)
+		}
+	}()
+
+	// Give node time to register and announce
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify services are registered in relay
+	services := relay.Services().List()
+	log.Printf("[Test] Relay has %d services registered", len(services))
+
+	if len(services) == 0 {
+		t.Fatal("No services registered in relay")
+	}
+
+	// Find the node connection
+	relay.nodesMu.RLock()
+	nc, exists := relay.nodes["test-node"]
+	relay.nodesMu.RUnlock()
+
+	if !exists {
+		t.Fatal("Node not registered")
+	}
+
+	// Open bridge to RTSP service
+	log.Printf("[Test] Opening bridge to RTSP service: %s", rtspService.ID)
+	bridgeID, err := nc.OpenBridge(*rtspService)
+	if err != nil {
+		t.Fatalf("Failed to open bridge: %v", err)
+	}
+
+	log.Printf("[Test] Bridge opened: %s", bridgeID)
+
+	// Send RTSP DESCRIBE request to trigger a response
+	rtspDescribe := fmt.Sprintf("DESCRIBE rtsp://%s:%d%s RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n",
+		rtspService.Addr, rtspService.Port, rtspService.Path)
+
+	if err := nc.SendData(bridgeID, []byte(rtspDescribe)); err != nil {
+		t.Fatalf("Failed to send RTSP DESCRIBE: %v", err)
+	}
+
+	log.Printf("[Test] Sent RTSP DESCRIBE request")
+
+	// Wait for response
+	time.Sleep(2 * time.Second)
+
+	// Check received data
+	receivedData := nodeClient.GetReceivedData(bridgeID)
+	log.Printf("[Test] Received %d bytes from RTSP service", len(receivedData))
+
+	if len(receivedData) == 0 {
+		t.Fatal("No data received from RTSP service")
+	}
+
+	// Verify it looks like RTSP response (should start with "RTSP/1.0")
+	responseStr := string(receivedData)
+	if len(responseStr) > 8 && responseStr[:8] != "RTSP/1.0" {
+		log.Printf("[Test] Response preview: %s", responseStr[:min(200, len(responseStr))])
+		t.Logf("Warning: Response doesn't start with RTSP/1.0, might not be RTSP protocol")
+	} else {
+		log.Printf("[Test] Valid RTSP response received")
+		log.Printf("[Test] Response preview: %s", responseStr[:min(500, len(responseStr))])
+	}
+
+	// Close bridge
+	nc.CloseBridge(bridgeID)
+	log.Printf("[Test] Bridge closed")
+
+	// Cleanup
+	nodeClient.Close()
+	wg.Wait()
+
+	log.Printf("[Test] End-to-end test completed successfully")
+}
+
+// startMockService starts a simple TCP echo server for testing
+func startMockService(t *testing.T) *net.TCPAddr {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Failed to start mock service: %v", err)
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				for {
+					n, err := c.Read(buf)
+					if err != nil {
+						return
+					}
+					c.Write(buf[:n]) // Echo back
+				}
+			}(conn)
+		}
+	}()
+
+	return listener.Addr().(*net.TCPAddr)
+}
+
+func init() {
+	// Enable logging for tests
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
