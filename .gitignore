@@ -2,3 +2,6 @@ relay/config.json
 relay/target
 node/target
 node/allowlist.json
+rust-node/
+rust-relay/
+unblink-engine/
